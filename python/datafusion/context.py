@@ -638,7 +638,7 @@ class SessionContext:
         self,
         partitions: list[list[pa.RecordBatch]],
         name: str | None = None,
-        schema: ArrowSchemaExportable | None = None,
+        schema: pa.schema | None = None,
     ) -> DataFrame:
         """Create and return a dataframe using the provided partitions.
 
