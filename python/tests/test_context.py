@@ -19,8 +19,12 @@ import gzip
 import pathlib
 
 import pyarrow as pa
+from pyarrow import (
+    Table,
+)
 import pyarrow.dataset as ds
 import pytest
+from datafusion.context import ArrowSchemaExportable, ArrowArrayExportable, ArrowStreamExportable
 from datafusion import (
     DataFrame,
     RuntimeEnvBuilder,
@@ -30,6 +34,56 @@ from datafusion import (
     column,
     literal,
 )
+
+def test_from_arrow_with_polars():
+    """Test from_arrow accepts Polars DataFrames via PyCapsule."""
+    pl = pytest.importorskip("polars")
+    
+    ctx: SessionContext = SessionContext()
+    pl_df = pl.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+    arrow_table: ArrowStreamExportable = pl_df.to_arrow()
+    result: DataFrame = ctx.from_arrow(arrow_table)
+    assert result is not None
+
+def test_register_csv_with_polars_schema(tmp_path):
+    """Test register_csv accepts Polars schema via PyCapsule."""
+    pl = pytest.importorskip("polars")
+    import pathlib
+    
+    csv_file: pathlib.Path = tmp_path / "test.csv"
+    csv_file.write_text("a,b\n1,x\n2,y\n")
+    
+    ctx: SessionContext = SessionContext()
+    # Get Polars Arrow schema directly (implements __arrow_c_schema__)
+    pl_table = pl.DataFrame({"a": [1], "b": ["x"]})
+    arrow_schema: ArrowSchemaExportable = pl_table.to_arrow().schema
+    
+    ctx.register_csv("test", str(csv_file), schema=arrow_schema)
+    df: DataFrame = ctx.table("test")
+    assert df is not None
+
+def test_from_arrow_with_nanoarrow():
+    """Test from_arrow accepts nanoarrow data."""
+    nanoarrow = pytest.importorskip("nanoarrow")
+    pa = pytest.importorskip("pyarrow")
+    
+    ctx: SessionContext = SessionContext()
+    table: Table = pa.table({"a": [1, 2, 3]})
+    na_array: ArrowArrayExportable = nanoarrow.Array(table)
+    result: DataFrame = ctx.from_arrow(na_array)
+    assert result is not None
+
+def test_no_pyarrow_import():
+    """Verify datafusion can be imported without pyarrow."""
+    import sys
+    
+    # Remove pyarrow if imported
+    if 'pyarrow' in sys.modules:
+        del sys.modules['pyarrow']
+    
+    import datafusion
+    ctx = datafusion.SessionContext()
+    assert ctx is not None
 
 
 def test_create_context_no_args():
