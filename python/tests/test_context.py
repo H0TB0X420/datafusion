@@ -73,18 +73,6 @@ def test_from_arrow_with_nanoarrow():
     result: DataFrame = ctx.from_arrow(na_array)
     assert result is not None
 
-def test_no_pyarrow_import():
-    """Verify datafusion can be imported without pyarrow."""
-    import sys
-    
-    # Remove pyarrow if imported
-    if 'pyarrow' in sys.modules:
-        del sys.modules['pyarrow']
-    
-    import datafusion
-    ctx = datafusion.SessionContext()
-    assert ctx is not None
-
 
 def test_create_context_no_args():
     SessionContext()

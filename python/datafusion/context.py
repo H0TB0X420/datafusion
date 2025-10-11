@@ -55,6 +55,10 @@ if TYPE_CHECKING:
 class ArrowSchemaExportable(Protocol):
     """Type hint for object exporting Arrow Schema via Arrow PyCapsule Interface.
 
+    This allows passing schemas from nanoarrow, arro3, Polars, DuckDB, etc.
+    Note: PyArrow remains a required dependency for scalar conversions and other
+    core functionality.
+    
     https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html
     """
 

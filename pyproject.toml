@@ -43,11 +43,9 @@ classifiers = [
     "Programming Language :: Python",
     "Programming Language :: Rust",
 ]
-dependencies = ["typing-extensions;python_version<'3.13'"]
+dependencies = ["pyarrow>=11.0.0", "typing-extensions;python_version<'3.13'"]
 dynamic = ["version"]
 
-[project.optional-dependencies]
-pyarrow = ["pyarrow>=11.0.0"]
 
 [project.urls]
 homepage = "https://datafusion.apache.org/python"
