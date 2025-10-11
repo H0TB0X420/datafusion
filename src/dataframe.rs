@@ -31,12 +31,10 @@ use datafusion::arrow::util::pretty;
 use datafusion::common::UnnestOptions;
 use datafusion::config::{CsvOptions, ParquetColumnOptions, ParquetOptions, TableParquetOptions};
 use datafusion::dataframe::{DataFrame, DataFrameWriteOptions};
-use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::parquet::basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel};
 use datafusion::prelude::*;
-use datafusion_ffi::table_provider::FFI_TableProvider;
 use futures::{StreamExt, TryStreamExt};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -44,12 +42,12 @@ use pyo3::pybacked::PyBackedStr;
 use pyo3::types::{PyCapsule, PyList, PyTuple, PyTupleMethods};
 use tokio::task::JoinHandle;
 
-use crate::catalog::PyTable;
 use crate::errors::{py_datafusion_err, to_datafusion_err, PyDataFusionError};
 use crate::expr::sort_expr::to_sort_expressions;
 use crate::physical_plan::PyExecutionPlan;
 use crate::record_batch::PyRecordBatchStream;
 use crate::sql::logical::PyLogicalPlan;
+use crate::table::PyTable;
 use crate::utils::{
     get_tokio_runtime, is_ipython_env, py_obj_to_scalar_value, validate_pycapsule, wait_for_future,
 };
@@ -58,39 +56,12 @@ use crate::{
     expr::{sort_expr::PySortExpr, PyExpr},
 };
 
-// https://github.com/apache/datafusion-python/pull/1016#discussion_r1983239116
-// - we have not decided on the table_provider approach yet
-// this is an interim implementation
-#[pyclass(name = "TableProvider", module = "datafusion")]
-pub struct PyTableProvider {
-    provider: Arc<dyn TableProvider + Send>,
-}
+use parking_lot::Mutex;
 
-impl PyTableProvider {
-    pub fn new(provider: Arc<dyn TableProvider>) -> Self {
-        Self { provider }
-    }
-
-    pub fn as_table(&self) -> PyTable {
-        let table_provider: Arc<dyn TableProvider> = self.provider.clone();
-        PyTable::new(table_provider)
-    }
-}
-
-#[pymethods]
-impl PyTableProvider {
-    fn __datafusion_table_provider__<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<Bound<'py, PyCapsule>> {
-        let name = CString::new("datafusion_table_provider").unwrap();
-
-        let runtime = get_tokio_runtime().0.handle().clone();
-        let provider = FFI_TableProvider::new(Arc::clone(&self.provider), false, Some(runtime));
-
-        PyCapsule::new(py, provider, Some(name.clone()))
-    }
-}
+// Type aliases to simplify very complex types used in this file and
+// avoid compiler complaints about deeply nested types in struct fields.
+type CachedBatches = Option<(Vec<RecordBatch>, bool)>;
+type SharedCachedBatches = Arc<Mutex<CachedBatches>>;
 
 /// Configuration for DataFrame display formatting
 #[derive(Debug, Clone)]
@@ -188,7 +159,7 @@ fn build_formatter_config_from_python(formatter: &Bound<'_, PyAny>) -> PyResult<
 }
 
 /// Python mapping of `ParquetOptions` (includes just the writer-related options).
-#[pyclass(name = "ParquetWriterOptions", module = "datafusion", subclass)]
+#[pyclass(frozen, name = "ParquetWriterOptions", module = "datafusion", subclass)]
 #[derive(Clone, Default)]
 pub struct PyParquetWriterOptions {
     options: ParquetOptions,
@@ -249,7 +220,7 @@ impl PyParquetWriterOptions {
 }
 
 /// Python mapping of `ParquetColumnOptions`.
-#[pyclass(name = "ParquetColumnOptions", module = "datafusion", subclass)]
+#[pyclass(frozen, name = "ParquetColumnOptions", module = "datafusion", subclass)]
 #[derive(Clone, Default)]
 pub struct PyParquetColumnOptions {
     options: ParquetColumnOptions,
@@ -284,13 +255,13 @@ impl PyParquetColumnOptions {
 /// A PyDataFrame is a representation of a logical plan and an API to compose statements.
 /// Use it to build a plan and `.collect()` to execute the plan and collect the result.
 /// The actual execution of a plan runs natively on Rust and Arrow on a multi-threaded environment.
-#[pyclass(name = "DataFrame", module = "datafusion", subclass)]
+#[pyclass(name = "DataFrame", module = "datafusion", subclass, frozen)]
 #[derive(Clone)]
 pub struct PyDataFrame {
     df: Arc<DataFrame>,
 
     // In IPython environment cache batches between __repr__ and _repr_html_ calls.
-    batches: Option<(Vec<RecordBatch>, bool)>,
+    batches: SharedCachedBatches,
 }
 
 impl PyDataFrame {
@@ -298,16 +269,29 @@ impl PyDataFrame {
     pub fn new(df: DataFrame) -> Self {
         Self {
             df: Arc::new(df),
-            batches: None,
+            batches: Arc::new(Mutex::new(None)),
         }
     }
 
-    fn prepare_repr_string(&mut self, py: Python, as_html: bool) -> PyDataFusionResult<String> {
+    /// Return a clone of the inner Arc<DataFrame> for crate-local callers.
+    pub(crate) fn inner_df(&self) -> Arc<DataFrame> {
+        Arc::clone(&self.df)
+    }
+
+    fn prepare_repr_string(&self, py: Python, as_html: bool) -> PyDataFusionResult<String> {
         // Get the Python formatter and config
         let PythonFormatter { formatter, config } = get_python_formatter_with_config(py)?;
 
-        let should_cache = *is_ipython_env(py) && self.batches.is_none();
-        let (batches, has_more) = match self.batches.take() {
+        let is_ipython = *is_ipython_env(py);
+
+        let (cached_batches, should_cache) = {
+            let mut cache = self.batches.lock();
+            let should_cache = is_ipython && cache.is_none();
+            let batches = cache.take();
+            (batches, should_cache)
+        };
+
+        let (batches, has_more) = match cached_batches {
             Some(b) => b,
             None => wait_for_future(
                 py,
@@ -346,7 +330,8 @@ impl PyDataFrame {
         let html_str: String = html_result.extract()?;
 
         if should_cache {
-            self.batches = Some((batches, has_more));
+            let mut cache = self.batches.lock();
+            *cache = Some((batches.clone(), has_more));
         }
 
         Ok(html_str)
@@ -376,7 +361,7 @@ impl PyDataFrame {
         }
     }
 
-    fn __repr__(&mut self, py: Python) -> PyDataFusionResult<String> {
+    fn __repr__(&self, py: Python) -> PyDataFusionResult<String> {
         self.prepare_repr_string(py, false)
     }
 
@@ -411,7 +396,7 @@ impl PyDataFrame {
         Ok(format!("DataFrame()\n{batches_as_displ}{additional_str}"))
     }
 
-    fn _repr_html_(&mut self, py: Python) -> PyDataFusionResult<String> {
+    fn _repr_html_(&self, py: Python) -> PyDataFusionResult<String> {
         self.prepare_repr_string(py, true)
     }
 
@@ -427,22 +412,18 @@ impl PyDataFrame {
         PyArrowType(self.df.schema().into())
     }
 
-    /// Convert this DataFrame into a Table that can be used in register_table
+    /// Convert this DataFrame into a Table Provider that can be used in register_table
     /// By convention, into_... methods consume self and return the new object.
     /// Disabling the clippy lint, so we can use &self
     /// because we're working with Python bindings
     /// where objects are shared
-    /// https://github.com/apache/datafusion-python/pull/1016#discussion_r1983239116
-    /// - we have not decided on the table_provider approach yet
     #[allow(clippy::wrong_self_convention)]
-    fn into_view(&self) -> PyDataFusionResult<PyTable> {
+    pub fn into_view(&self) -> PyDataFusionResult<PyTable> {
         // Call the underlying Rust DataFrame::into_view method.
         // Note that the Rust method consumes self; here we clone the inner Arc<DataFrame>
-        // so that we don’t invalidate this PyDataFrame.
+        // so that we don't invalidate this PyDataFrame.
         let table_provider = self.df.as_ref().clone().into_view();
-        let table_provider = PyTableProvider::new(table_provider);
-
-        Ok(table_provider.as_table())
+        Ok(PyTable::from(table_provider))
     }
 
     #[pyo3(signature = (*args))]
@@ -874,7 +855,7 @@ impl PyDataFrame {
 
     #[pyo3(signature = (requested_schema=None))]
     fn __arrow_c_stream__<'py>(
-        &'py mut self,
+        &'py self,
         py: Python<'py>,
         requested_schema: Option<Bound<'py, PyCapsule>>,
     ) -> PyDataFusionResult<Bound<'py, PyCapsule>> {
